@@ -198,6 +198,7 @@ async fn drain_stream(mut stream: quinn::RecvStream, stats: &mut RequestStats) -
         Bytes::new(), Bytes::new(), Bytes::new(), Bytes::new(),
         Bytes::new(), Bytes::new(), Bytes::new(), Bytes::new(),
     ];
+
     while stream.read_chunks(&mut bufs[..]).await?.is_some() {
         if stats.first_byte.is_none() {
             stats.first_byte = Some(Instant::now());
@@ -227,6 +228,7 @@ async fn drive_uni(
     loop {
         let permit = sem.clone().acquire_owned().await.unwrap();
         let mut request_stats = RequestStats::new(upload, download);
+        let conn = connection.clone();
         let send = connection.open_uni().await?;
         let acceptor = acceptor.clone();
         let stats = stats.clone();
@@ -238,6 +240,7 @@ async fn drive_uni(
                 error!("sending request failed: {:#}", e);
             } else {
                 request_stats.success = true;
+                request_stats.latency = conn.rtt().as_millis() as u64;
             }
 
             {
@@ -307,6 +310,7 @@ async fn drive_bi(
     loop {
         let permit = sem.clone().acquire_owned().await.unwrap();
         let mut request_stats = RequestStats::new(upload, download);
+        let conn = connection.clone();
         let (send, recv) = connection.open_bi().await?;
         let stats = stats.clone();
 
@@ -316,6 +320,7 @@ async fn drive_bi(
                 error!("request failed: {:#}", e);
             } else {
                 request_stats.success = true;
+                request_stats.latency = conn.rtt().as_millis() as u64;
             }
 
             {
@@ -372,6 +377,7 @@ struct RequestStats {
     upload_size: u64,
     download_size: u64,
     success: bool,
+    latency: u64,
 }
 
 impl RequestStats {
@@ -385,6 +391,7 @@ impl RequestStats {
             download_size,
             download_end: None,
             success: false,
+            latency: 0,
         }
     }
 }
@@ -400,6 +407,8 @@ struct Stats {
     upload_throughput: Histogram<u64>,
     /// Throughput for downloads
     download_throughput: Histogram<u64>,
+    /// Client->Server->Client Latency
+    latency: Histogram<u64>,
     /// The total amount of requests executed
     requests: usize,
     /// The amount of successful requests
@@ -414,6 +423,7 @@ impl Default for Stats {
             fbl: Histogram::new(3).unwrap(),
             upload_throughput: Histogram::new(3).unwrap(),
             download_throughput: Histogram::new(3).unwrap(),
+            latency: Histogram::new(3).unwrap(),
             requests: 0,
             success: 0,
         }
@@ -455,6 +465,7 @@ impl Stats {
             .duration_since(request.upload_start.unwrap());
         let upload_bps = throughput_bps(upload_duration, request.upload_size);
         self.upload_throughput.record(upload_bps as u64).unwrap();
+        self.latency.record(request.latency).unwrap();
     }
 
     pub fn print(&self) {
@@ -474,15 +485,20 @@ impl Stats {
 
         println!("Stream metrics:\n");
 
-        println!("      │ Duration  │ FBL       | Upload Throughput | Download Throughput");
-        println!("──────┼───────────┼───────────┼───────────────────┼────────────────────");
+        println!(
+            "      │ Duration  │ FBL       │ Latency   │ Upload Throughput │ Download Throughput"
+        );
+        println!(
+            "──────┼───────────┼───────────┼───────────┼───────────────────┼────────────────────"
+        );
 
         let print_metric = |label: &'static str, get_metric: fn(&Histogram<u64>) -> u64| {
             println!(
-                " {} │ {:>9} │ {:>9} │ {:11.2} MiB/s │ {:13.2} MiB/s",
+                " {} │ {:>9} │ {:>9} │ {:>9} │ {:11.2} MiB/s │ {:13.2} MiB/s",
                 label,
                 format!("{:.2?}", Duration::from_millis(get_metric(&self.duration))),
                 format!("{:.2?}", Duration::from_millis(get_metric(&self.fbl))),
+                format!("{:.2?}", Duration::from_millis(get_metric(&self.latency))),
                 get_metric(&self.upload_throughput) as f64 / 1024.0 / 1024.0,
                 get_metric(&self.download_throughput) as f64 / 1024.0 / 1024.0,
             );
